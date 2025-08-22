@@ -1,0 +1,30 @@
+# Datasets
+/datasets/
+
+# issues
+/issues/
+
+# Outputs, logs, models
+/outputs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+/.history/
+
+# Env files
+.env
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+todo.md
+
