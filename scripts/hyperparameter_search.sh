@@ -4,17 +4,15 @@
 # 支持GPU队列管理和动态任务调度
 
 # 超参数配置
-# LR_VALUES=(1e-4 3e-4 1e-5 3e-5 1e-6 3e-6)
-LR_VALUES=(3e-5 3e-6 1e-6)
+LR_VALUES=(1e-4 3e-4 1e-5 3e-5 1e-6 3e-6 1e-7 1e-3)
 L2_VALUES=(0 1e-7 1e-6 1e-5)
-MARGINS=(0.0 0.5 1.0 2.0 5.0 10.0)
 GNN_TYPES=(GCN GAT)
-LAYER_VALUES=(2 4 10)
+LAYER_VALUES=(2 3 4 5 10)
 EPOCHS=5
 
 # GPU配置 - 用户可修改这个数组来控制并发数
 # 例如: GPUS=(6 6 6 7 7 7) 表示GPU6和GPU7各跑3个并发任务
-GPUS=(0 0 0 1 1 1 2 2 2 3 3 3 6 6 6 7 7 7)  # 默认配置，用户可根据需要修改
+GPUS=(6 6 6 7 7 7)  # 默认配置，用户可根据需要修改
 
 # 全局变量
 declare -a RUNNING_JOBS=()  # 存储正在运行的任务PID
@@ -37,11 +35,9 @@ generate_experiments() {
         for l2 in "${L2_VALUES[@]}"; do
             for gnn_type in "${GNN_TYPES[@]}"; do
                 for layers in "${LAYER_VALUES[@]}"; do
-                    for margin in "${MARGINS[@]}"; do
-                        local exp_name="lr=${lr}_l2=${l2}_type=${gnn_type}_layer=${layers}_margin=${margin}"
-                        ALL_EXPERIMENTS+=("$lr|$l2|$gnn_type|$layers|$margin|$exp_name")
-                        ((count++))
-                    done
+                    local exp_name="lr=${lr}_l2=${l2}_type=${gnn_type}_layer=${layers}"
+                    ALL_EXPERIMENTS+=("$lr|$l2|$gnn_type|$layers|$exp_name")
+                    ((count++))
                 done
             done
         done
@@ -69,16 +65,14 @@ start_experiment() {
     local exp_config=$2
     
     # 解析实验配置
-    IFS='|' read -r lr l2 gnn_type layers margin exp_name <<< "$exp_config"
+    IFS='|' read -r lr l2 gnn_type layers exp_name <<< "$exp_config"
     local gpu_id=${GPUS[$gpu_slot]}
     
     # 创建日志文件路径
-    local log_dir="outputs/logs/margin"
-    mkdir -p "$log_dir"
-    local log_file="$log_dir/${exp_name}.log"
+    local log_file="outputs/logs/${exp_name}.log"
     
     # 构建命令
-    local cmd="python src/main.py --device $gpu_id --lr $lr --weight-decay $l2 --gnn-type $gnn_type --gnn-layers $layers --epochs $EPOCHS --delta-margin $margin --log-name ${exp_name} --model-name ${exp_name}"
+    local cmd="python src/main.py --device $gpu_id --lr $lr --weight-decay $l2 --gnn-type $gnn_type --gnn-layers $layers --epochs $EPOCHS --log-name ${exp_name} --model-name ${exp_name}"
     
     echo "[$(date '+%H:%M:%S')] 启动实验: $exp_name (GPU $gpu_id, 槽位 $gpu_slot)"
     echo "命令: $cmd"

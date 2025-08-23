@@ -8,20 +8,20 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 EPOCH_LINE_RE = re.compile(
-    r"Epoch:\s*(\d+),\s*Train Loss:\s*([0-9.]+),\s*Val Loss:\s*([0-9.]+)\s*\(Free:\s*([0-9.]+)\),\s*Recall:\s*([0-9.]+),\s*F1:\s*([0-9.]+)"
+    r"Epoch:\s*(\d+),\s*Train Loss:\s*([0-9.]+),\s*Val Loss:\s*([0-9.]+),\s*Recall:\s*([0-9.]+),\s*F1:\s*([0-9.]+)"
 )
 TEST_LINE_RE = re.compile(
-    r"Test Loss:\s*([0-9.]+)\s*\(Free:\s*([0-9.]+)\),\s*Test Recall:\s*([0-9.]+),\s*Test F1:\s*([0-9.]+)"
+    r"Test Loss:\s*([0-9.]+),\s*Test Recall:\s*([0-9.]+),\s*Test F1:\s*([0-9.]+)"
 )
 
 
 
-def parse_log_file(path: Path) -> Tuple[List[int], List[float], List[float], List[float], List[float], Tuple[float, float, float, float] | None]:
+def parse_log_file(path: Path) -> Tuple[List[int], List[float], List[float], List[float], Tuple[float, float, float] | None]:
     """Parse a single log file and return per-epoch lists and final test metrics.
-    Returns (epochs, val_losses, val_losses_free, recalls, f1s, test_metrics) where test_metrics is (loss, loss_free, recall, f1) or None.
+    Returns (epochs, val_losses, recalls, f1s, test_metrics) where test_metrics is (loss, recall, f1) or None.
     """
-    matches: Dict[int, Tuple[float, float, float, float]] = {}  # (val_loss, val_loss_free, recall, f1)
-    test_metrics: Tuple[float, float, float, float] | None = None
+    matches: Dict[int, Tuple[float, float, float]] = {}
+    test_metrics: Tuple[float, float, float] | None = None
     try:
         with path.open('r', encoding='utf-8', errors='ignore') as f:
             for line in f:
@@ -30,31 +30,28 @@ def parse_log_file(path: Path) -> Tuple[List[int], List[float], List[float], Lis
                     ep = int(m.group(1))
                     # train_loss = float(m.group(2))  # parsed but unused
                     val_loss = float(m.group(3))
-                    val_loss_free = float(m.group(4))
-                    recall = float(m.group(5))
-                    f1 = float(m.group(6))
+                    recall = float(m.group(4))
+                    f1 = float(m.group(5))
                     # Keep the last occurrence for an epoch if duplicated
-                    matches[ep] = (val_loss, val_loss_free, recall, f1)
+                    matches[ep] = (val_loss, recall, f1)
                 t = TEST_LINE_RE.search(line)
                 if t:
                     test_loss = float(t.group(1))
-                    test_loss_free = float(t.group(2))
-                    test_recall = float(t.group(3))
-                    test_f1 = float(t.group(4))
-                    test_metrics = (test_loss, test_loss_free, test_recall, test_f1)
+                    test_recall = float(t.group(2))
+                    test_f1 = float(t.group(3))
+                    test_metrics = (test_loss, test_recall, test_f1)
     except Exception as e:
         print(f"[WARN] Failed to read {path}: {e}")
-        return [], [], [], [], [], None
+        return [], [], [], [], None
 
     if not matches:
-        return [], [], [], [], [], test_metrics
+        return [], [], [], [], test_metrics
 
     epochs_sorted = sorted(matches.keys())
     val_losses = [matches[e][0] for e in epochs_sorted]
-    val_losses_free = [matches[e][1] for e in epochs_sorted]
-    recalls = [matches[e][2] for e in epochs_sorted]
-    f1s = [matches[e][3] for e in epochs_sorted]
-    return epochs_sorted, val_losses, val_losses_free, recalls, f1s, test_metrics
+    recalls = [matches[e][1] for e in epochs_sorted]
+    f1s = [matches[e][2] for e in epochs_sorted]
+    return epochs_sorted, val_losses, recalls, f1s, test_metrics
 
 
 def is_strictly_decreasing(xs: List[float]) -> bool:
@@ -84,20 +81,19 @@ def first_violation_index(xs: List[float], cmp) -> int:
 
 
 def check_file(path: Path, strict: bool = True) -> Dict:
-    epochs, val_losses, val_losses_free, recalls, f1s, test_metrics = parse_log_file(path)
+    epochs, val_losses, recalls, f1s, test_metrics = parse_log_file(path)
     result = {
         'file': str(path),
         'epochs': epochs,
         'num_epochs': len(epochs),
         'val_losses': val_losses,
-        'val_losses_free': val_losses_free,
         'recalls': recalls,
         'f1s': f1s,
         'test_metrics': test_metrics,
-        'strict_val_loss_free_dec': False,
+        'strict_val_loss_dec': False,
         'strict_recall_inc': False,
         'strict_f1_inc': False,
-        'nonstrict_val_loss_free_dec': False,
+        'nonstrict_val_loss_dec': False,
         'nonstrict_recall_inc': False,
         'nonstrict_f1_inc': False,
         'violations': {}
@@ -105,12 +101,12 @@ def check_file(path: Path, strict: bool = True) -> Dict:
 
     if len(epochs) >= 2:
         if strict:
-            result['strict_val_loss_free_dec'] = is_strictly_decreasing(val_losses_free)
+            result['strict_val_loss_dec'] = is_strictly_decreasing(val_losses)
             result['strict_recall_inc'] = is_strictly_increasing(recalls)
             result['strict_f1_inc'] = is_strictly_increasing(f1s)
-            if not result['strict_val_loss_free_dec']:
-                idx = first_violation_index(val_losses_free, lambda a, b: a < b)
-                result['violations']['val_loss_free'] = idx
+            if not result['strict_val_loss_dec']:
+                idx = first_violation_index(val_losses, lambda a, b: a < b)
+                result['violations']['val_loss'] = idx
             if not result['strict_recall_inc']:
                 idx = first_violation_index(recalls, lambda a, b: a > b)
                 result['violations']['recall'] = idx
@@ -118,92 +114,81 @@ def check_file(path: Path, strict: bool = True) -> Dict:
                 idx = first_violation_index(f1s, lambda a, b: a > b)
                 result['violations']['f1'] = idx
         else:
-            result['nonstrict_val_loss_free_dec'] = is_non_increasing(val_losses_free)
+            result['nonstrict_val_loss_dec'] = is_non_increasing(val_losses)
             result['nonstrict_recall_inc'] = is_non_decreasing(recalls)
             result['nonstrict_f1_inc'] = is_non_decreasing(f1s)
     return result
 
 
 def main():
-    parser = argparse.ArgumentParser(description='分析 margin 日志：筛选“FREE LOSS最低时 Recall 也是最高”的日志，输出对应的 Test Recall 与最佳参数配置')
-    parser.add_argument('--logs-dir', type=str, default='outputs/logs/margin', help='日志目录 (包含 .log)')
+    parser = argparse.ArgumentParser(description='Scan logs for monotonic trends: val loss down, recall/f1 up.')
+    parser.add_argument('--logs-dir', type=str, default='outputs/logs', help='Directory containing .log files')
+    parser.add_argument('--strict', action='store_true', help='Use strict monotonicity (<, >) instead of non-strict (<=, >=)')
     args = parser.parse_args()
 
     logs_dir = Path(args.logs_dir)
     if not logs_dir.exists():
-        print(f"[ERR] 日志目录不存在: {logs_dir}")
+        print(f"[ERR] Logs dir not found: {logs_dir}")
         return 1
 
     log_files = sorted([p for p in logs_dir.glob('*.log') if p.is_file()])
     if not log_files:
-        print(f"[WARN] 未在 {logs_dir} 找到 .log 文件")
+        print(f"[WARN] No .log files found in {logs_dir}")
         return 0
 
-    matched = []  # 收集满足条件的 (file, config_info, min_ep, min_free, recall_at_min_free, test_recall)
-    best_overall = None  # (test_recall, file, config_str)
+    strict = args.strict
+    ok_files = []
+    best_ok = None  # (test_recall, file_name)
 
     for lf in log_files:
-        ep, val_losses, val_free, recalls, f1s, test_metrics = parse_log_file(lf)
-        if not ep:
+        res = check_file(lf, strict=strict)
+        epochs = res['epochs']
+        if len(epochs) < 2:
+            print(f"[SKIP] {lf.name}: not enough epochs ({len(epochs)})")
             continue
 
-        # FREE LOSS 最低值与其所有出现位置
-        min_free_value = min(val_free)
-        idx_min_list = [i for i, v in enumerate(val_free) if abs(v - min_free_value) < 1e-12]
+        val_first, val_last = res['val_losses'][0], res['val_losses'][-1]
+        rec_first, rec_last = res['recalls'][0], res['recalls'][-1]
+        f1_first, f1_last = res['f1s'][0], res['f1s'][-1]
 
-        # 该日志的最高 Recall
-        max_recall = max(recalls) if recalls else None
-        if max_recall is None:
-            continue
+        if strict:
+            ok = res['strict_val_loss_dec'] and res['strict_recall_inc'] and res['strict_f1_inc']
+        else:
+            ok = res['nonstrict_val_loss_dec'] and res['nonstrict_recall_inc'] and res['nonstrict_f1_inc']
 
-        # 在所有 free_min 的位置中，查找是否存在 recall==max_recall 的位置
-        chosen_idx = None
-        for i in idx_min_list:
-            if abs(recalls[i] - max_recall) < 1e-12:
-                chosen_idx = i
-                break
-        if chosen_idx is None:
-            continue  # 不满足条件
+        status = 'OK' if ok else 'FAIL'
+        mode = 'strict' if strict else 'nonstrict'
+        print(f"[{status}] ({mode}) {lf.name} | epochs={len(epochs)} | Val {val_first:.4f}->{val_last:.4f} | Rec {rec_first:.4f}->{rec_last:.4f} | F1 {f1_first:.4f}->{f1_last:.4f}")
 
-        min_ep = ep[chosen_idx]
-        min_free = val_free[chosen_idx]
-        min_free_recall = recalls[chosen_idx]
+        if not ok and strict:
+            v = res['violations']
+            viol_msgs = []
+            if 'val_loss' in v and v['val_loss'] is not None and v['val_loss'] >= 0:
+                viol_msgs.append(f"val_loss breaks at i={v['val_loss']}(epoch {epochs[v['val_loss']]})")
+            if 'recall' in v and v['recall'] is not None and v['recall'] >= 0:
+                viol_msgs.append(f"recall breaks at i={v['recall']}(epoch {epochs[v['recall']]})")
+            if 'f1' in v and v['f1'] is not None and v['f1'] >= 0:
+                viol_msgs.append(f"f1 breaks at i={v['f1']}(epoch {epochs[v['f1']]})")
+            if viol_msgs:
+                print("       Violations: " + "; ".join(viol_msgs))
 
-        # 提取参数配置
-        config_info = ""
-        if "margin=" in lf.name:
-            parts = lf.name.replace('.log', '').split('_')
-            cfg = []
-            for p in parts:
-                if any(k in p for k in ['lr=', 'l2=', 'type=', 'layer=', 'margin=']):
-                    cfg.append(p)
-            config_info = ' | '.join(cfg)
+        if ok:
+            ok_files.append(lf.name)
+            # 记录最佳 test recall
+            tm = res.get('test_metrics')
+            if tm is not None:
+                test_recall = tm[1]
+                if (best_ok is None) or (test_recall > best_ok[0]):
+                    best_ok = (test_recall, lf.name)
 
-        test_recall = None
-        if test_metrics is not None:
-            test_recall = test_metrics[2]
-
-        matched.append((lf.name, config_info, min_ep, min_free, min_free_recall, test_recall))
-
-        # 维护满足条件集合中的“最佳 Test Recall”
-        if test_recall is not None and ((best_overall is None) or (test_recall > best_overall[0])):
-            best_overall = (test_recall, lf.name, config_info)
-
-    # 数量统计
-    print(f"满足条件的日志数: {len(matched)} / {len(log_files)}")
-    if not matched:
-        print("未找到满足条件的日志。")
-        return 0
-
-    # 输出满足条件的日志（单行输出）
-    for name, cfg, ep_min, free_min, rec_at_min, test_rec in matched:
-        test_rec_str = f"{test_rec:.4f}" if test_rec is not None else "N/A"
-        print(f"file={name} | config={cfg} | epoch_min={ep_min} | free_loss_min={free_min:.4f} | recall_at_min(max)={rec_at_min:.4f} | test_recall={test_rec_str}")
-
-    # 输出满足条件集合中 Test Recall 最高者（单行）
-    if best_overall is not None:
-        print("=" * 100)
-        print(f"BEST | file={best_overall[1]} | config={best_overall[2]} | test_recall={best_overall[0]:.4f}")
+    print("\nSummary:")
+    print(f"  Total logs: {len(log_files)}")
+    print(f"  Passing ({'strict' if strict else 'nonstrict'}): {len(ok_files)}")
+    if ok_files:
+        for name in ok_files:
+            print(f"    - {name}")
+    if best_ok is not None:
+        print(f"\nBest among OK (by Test Recall): {best_ok[1]} (Test Recall={best_ok[0]:.4f})")
 
     return 0
 

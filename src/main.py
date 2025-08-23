@@ -75,7 +75,6 @@ def create_config(args):
         'MAX_SEQUENCE_LENGTH': args.max_sequence_length,
         'EMBED_BATCH_SIZE': args.embed_batch_size,
         'EMBED_DTYPE': args.embed_dtype,
-        'DELTA_MARGIN': args.delta_margin,
         'RANDOM_SEED': 42,  # 默认不固定种子
 
         # 设备配置 (将在后面处理)
@@ -143,8 +142,8 @@ def parse_arguments():
                        help='GNN层数 (默认: 2)')
     parser.add_argument('--mlp-hidden-dim', type=int, default=512,
                        help='输出MLP隐藏层维度 (默认: 512)')
-    parser.add_argument('--dropout-rate', type=float, default=0.1,
-                       help='Dropout率 (默认: 0.1)')
+    parser.add_argument('--dropout-rate', type=float, default=0.0,
+                       help='Dropout率 (默认: 0.0)')
     parser.add_argument('--num-heads', type=int, default=4,
                        help='GAT注意力头数 (默认: 4)')
 
@@ -157,17 +156,14 @@ def parse_arguments():
                        help='L2正则化参数 (默认: 0)')
     parser.add_argument('--optimizer', type=str, default='Adam',
                        help='优化器类型 (默认: Adam)')
-    parser.add_argument('--early-stopping-patience', type=int, default=2,
-                       help='早停耐心值 (默认: 2)')
+    parser.add_argument('--early-stopping-patience', type=int, default=10,
+                       help='早停耐心值 (默认: 10)')
     parser.add_argument('--train-split', type=float, default=0.7,
                        help='训练集比例 (默认: 0.7)')
     parser.add_argument('--val-split', type=float, default=0.1,
                        help='验证集比例 (默认: 0.1)')
     parser.add_argument('--test-split', type=float, default=0.2,
                        help='测试集比例 (默认: 0.2)')
-    parser.add_argument('--delta-margin', type=float, default=0.0,
-                       help='Delta损失的margin：正样本推向query+margin之上，负样本推向query-margin之下 (默认: 0.0)')
-
 
     # 数据预处理参数
     parser.add_argument('--co-occurrence-threshold', type=int, default=2,
@@ -178,7 +174,6 @@ def parse_arguments():
                        help='预处理时生成嵌入的批大小 (默认: 1)')
     parser.add_argument('--embed-dtype', type=str, choices=['fp16', 'fp32'], default='fp32',
                        help='预处理嵌入模型权重精度: fp16 或 fp32 (默认: fp16)')
-
 
     # 设备参数
     parser.add_argument('--device', type=str, default='0',
