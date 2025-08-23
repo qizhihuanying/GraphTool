@@ -2,6 +2,10 @@
 GraphTool主程序 - 简化版
 默认运行完整的训练+验证+测试流程
 """
+import os
+# 关闭 HuggingFace tokenizers 并行相关警告
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import argparse
 from pathlib import Path
 import torch
@@ -156,8 +160,8 @@ def parse_arguments():
                        help='L2正则化参数 (默认: 0)')
     parser.add_argument('--optimizer', type=str, default='Adam',
                        help='优化器类型 (默认: Adam)')
-    parser.add_argument('--early-stopping-patience', type=int, default=10,
-                       help='早停耐心值 (默认: 10)')
+    parser.add_argument('--early-stopping-patience', type=int, default=2,
+                       help='早停耐心值 (默认: 2)')
     parser.add_argument('--train-split', type=float, default=0.7,
                        help='训练集比例 (默认: 0.7)')
     parser.add_argument('--val-split', type=float, default=0.1,

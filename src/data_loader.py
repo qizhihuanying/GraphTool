@@ -557,8 +557,8 @@ def create_training_samples_toolbench(data: List[Dict], tool_to_idx: Dict[str, i
 
 
 def prepare_data(config):
-    """准备ToolBench G3数据：构建图和创建训练、验证、测试样本"""
-    logger.info("开始ToolBench G3数据预处理...")
+    """准备ToolBench数据：自动合并多个指定/默认路径的数据（支持G2+G3），构建图与样本"""
+    logger.info("开始ToolBench数据预处理（自动合并 G2+G3）...")
 
     # 检查是否已有预处理数据
     if (config['FULL_GRAPH_PATH'].exists() and
@@ -568,24 +568,34 @@ def prepare_data(config):
         logger.info("发现已有预处理数据，跳过预处理步骤")
         return
 
-    # 加载ToolBench G3数据（优先新路径，兼容旧路径）
-    primary_path = config.get('dataset_path', config['TOOLBENCH_DIR'] / 'G3_query.json')
-    legacy_path = config['TOOLBENCH_DIR'] / 'data' / 'instruction' / 'G3_query.json'
-
-    if primary_path.exists():
-        g3_data_file = primary_path
-        logger.info(f"使用数据文件: {g3_data_file} (config.dataset_path)")
-    elif legacy_path.exists():
-        g3_data_file = legacy_path
-        logger.warning(f"未找到 {primary_path}，回退到旧路径: {legacy_path}")
+    # 收集候选数据路径：优先使用 --dataset-path；若为空则默认 datasets/ToolBench 下的 G3 和 G2
+    paths = []
+    ds_path = config.get('dataset_path')
+    if ds_path is not None:
+        # 若传入的是目录，则合并目录下所有 *_query.json
+        p = Path(ds_path)
+        if p.is_dir():
+            paths.extend(sorted(p.glob("*query.json")))
+        else:
+            paths.append(p)
     else:
-        raise FileNotFoundError(
-            f"未找到 ToolBench G3 数据。请将 G3_query.json 放在以下任一路径:\n  - {primary_path}\n  - {legacy_path}"
-        )
+        default_g3 = config['TOOLBENCH_DIR'] / 'G3_query.json'
+        default_g2 = config['TOOLBENCH_DIR'] / 'G2_query.json'
+        for p in [default_g3, default_g2]:
+            if p.exists():
+                paths.append(p)
 
-    logger.info(f"加载ToolBench G3数据: {g3_data_file}")
-    all_data = load_toolbench_g3_data(g3_data_file)
-    logger.info(f"成功加载 {len(all_data)} 条样本")
+    if not paths:
+        raise FileNotFoundError("未找到任何 ToolBench 数据文件，请提供 --dataset-path 或将 G2/G3 放到 datasets/ToolBench/")
+
+    # 加载并合并
+    all_data = []
+    total_each = []
+    for p in paths:
+        data = load_toolbench_g3_data(p)
+        all_data.extend(data)
+        total_each.append((p.name, len(data)))
+    logger.info("已合并数据文件：" + ", ".join([f"{n}:{c}" for n,c in total_each]) + f"；合计 {len(all_data)} 条")
 
     # 随机打乱数据
     import random
@@ -595,18 +605,16 @@ def prepare_data(config):
     # 划分训练、验证、测试数据
     from sklearn.model_selection import train_test_split
 
-    # 首先分离出测试集（不使用固定种子，实现真正的随机划分）
     train_val_data, test_data = train_test_split(
         all_data,
         test_size=config['TEST_SPLIT'],
-        random_state=None  # 不固定种子
+        random_state=None
     )
 
-    # 然后从剩余数据中分离训练集和验证集
     train_data, val_data = train_test_split(
         train_val_data,
         test_size=config['VAL_SPLIT'] / (config['TRAIN_SPLIT'] + config['VAL_SPLIT']),
-        random_state=None  # 不固定种子
+        random_state=None
     )
 
     logger.info(f"数据划分完成:")
@@ -624,7 +632,7 @@ def prepare_data(config):
 
     # 构建ToolBench工具图（节点用所有数据，边用train+val数据）
     logger.info("构建ToolBench工具依赖图...")
-    train_val_combined = train_data + val_data  # 合并训练和验证数据用于边构建
+    train_val_combined = train_data + val_data
     node_features, tool_to_idx, edge_index = build_tool_graph_toolbench(config, all_data, train_val_combined, embedding_generator)
 
     if len(tool_to_idx) == 0:
@@ -667,7 +675,7 @@ def prepare_data(config):
     embedding_generator.save_cache(cache_path)
 
     logger.info("=" * 50)
-    logger.info("ToolBench G3数据预处理完成！")
+    logger.info("ToolBench 数据预处理完成！(G2+G3)")
     logger.info(f"API工具数量: {len(tool_to_idx)}")
     logger.info(f"图边数量: {edge_index.size(1)}")
     logger.info(f"训练样本: {len(train_samples)} 个")

@@ -535,3 +535,104 @@ def get_query_threshold_predictions(tool_probs, query_probs, batch):
 
     return predictions
 
+
+
+# ==================== 检索排名指标 ====================
+from typing import Iterable
+
+def _topk_metrics_for_one_query(scores: torch.Tensor, labels: torch.Tensor, ks: Iterable[int]) -> Dict[str, float]:
+    """
+    对单个查询的候选集合计算 R@K、NDCG@K、COMP@K（binary relevance）。
+    scores: [N]
+    labels: [N] in {0,1}
+    返回一个包含各K汇总的字典。
+    """
+    import torch
+    ks = list(sorted(set(int(k) for k in ks)))
+    n = scores.numel()
+    if n == 0:
+        return {f"R@{k}": 0.0 for k in ks} | {f"N@{k}": 0.0 for k in ks} | {f"C@{k}": 0.0 for k in ks}
+
+    # 排序（降序）
+    sorted_idx = torch.argsort(scores, descending=True)
+    sorted_labels = labels[sorted_idx].float()
+
+    # 真实正样本个数
+    gt = int((labels > 0.5).sum().item())
+    if gt == 0:
+        # 无正样本：定义为全0，避免分母为0
+        return {f"R@{k}": 0.0 for k in ks} | {f"N@{k}": 0.0 for k in ks} | {f"C@{k}": 0.0 for k in ks}
+
+    # 前缀累积
+    cumsum = torch.cumsum(sorted_labels, dim=0)
+
+    out: Dict[str, float] = {}
+    for k in ks:
+        kk = min(k, n)
+        hits_k = cumsum[kk - 1].item()
+        # Recall@K
+        out[f"R@{k}"] = float(hits_k / gt)
+        # NDCG@K（binary relevance）：DCG = sum(rel_i / log2(i+2)); IDCG = sum_{i=1..min(K,gt)} 1/log2(i+1)
+        denom = torch.log2(torch.arange(2, kk + 2, dtype=torch.float, device=sorted_labels.device))
+        dcg = (sorted_labels[:kk] / denom).sum().item()
+        ideal_kk = min(kk, gt)
+        idcg = (1.0 / torch.log2(torch.arange(2, ideal_kk + 2, dtype=torch.float, device=sorted_labels.device))).sum().item()
+        ndcg = (dcg / idcg) if idcg > 0 else 0.0
+        out[f"N@{k}"] = float(ndcg)
+        # COMP@K：Top-K 是否覆盖全部GT
+        out[f"C@{k}"] = 1.0 if hits_k >= gt and gt > 0 else 0.0
+
+    return out
+
+
+def compute_retrieval_metrics_for_batch(tool_logits: torch.Tensor, query_logits: torch.Tensor, batch, ks: Iterable[int] = (3, 5), threshold_mode: str = 'query') -> Dict[str, float]:
+    """
+    基于一个批次的图输出，计算并累加六项指标之和以及样本数：
+    返回字典包含 R@3,R@5,N@3,N@5,C@3,C@5 与 count。
+    评分策略：
+      - threshold_mode=='query'：score = tool_logits - 对应query_logit（delta）
+      - threshold_mode=='fixed'：score = sigmoid(tool_logits)
+    """
+    import torch
+
+    # 提取工具节点掩码与图索引
+    _, tool_mask = create_node_masks(batch.batch, batch.num_graphs)
+    tool_batch_indices = batch.batch[tool_mask]
+
+    # 计算每个工具节点的得分
+    if threshold_mode == 'query':
+        scores = tool_logits - query_logits[tool_batch_indices]
+    else:
+        scores = torch.sigmoid(tool_logits)
+
+    # 拉取对应的二值标签
+    labels = extract_tool_labels(batch, device=tool_logits.device)
+
+    # 将工具节点按图分组
+    num_graphs = int(batch.num_graphs)
+    # 统计每个图的工具节点数量
+    counts = torch.bincount(tool_batch_indices, minlength=num_graphs)
+
+    # 前缀切片
+    metrics_sum = {f"R@{k}": 0.0 for k in ks}
+    metrics_sum.update({f"N@{k}": 0.0 for k in ks})
+    metrics_sum.update({f"C@{k}": 0.0 for k in ks})
+    total = 0
+
+    start = 0
+    for g in range(num_graphs):
+        cnt = int(counts[g].item())
+        if cnt <= 0:
+            continue
+        s = scores[start:start+cnt]
+        l = labels[start:start+cnt]
+        per = _topk_metrics_for_one_query(s, l, ks)
+        for k in ks:
+            metrics_sum[f"R@{k}"] += per[f"R@{k}"]
+            metrics_sum[f"N@{k}"] += per[f"N@{k}"]
+            metrics_sum[f"C@{k}"] += per[f"C@{k}"]
+        total += 1
+        start += cnt
+
+    metrics_sum['count'] = float(total)
+    return metrics_sum

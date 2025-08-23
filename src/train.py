@@ -4,17 +4,16 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
+
 from tqdm import tqdm
 import logging
 from pathlib import Path
 from typing import Dict, List
-import os
+
 
 from model import QueryAwareGNN
-from sklearn.metrics import f1_score
-from utils import (calculate_metrics, EarlyStopping, extract_tool_labels,
-                   make_predictions, log_sample_details)
+from utils import (EarlyStopping, extract_tool_labels,
+                   make_predictions, log_sample_details, compute_retrieval_metrics_for_batch)
 
 logger = logging.getLogger(__name__)
 
@@ -77,17 +76,15 @@ class Trainer:
             min_delta=1e-4
         )
         
-        # 训练历史
+        # 训练历史（仅记录loss，排名指标按epoch打印即可）
         self.train_history = {
-            'loss': [],
-            'recall': []
+            'loss': []
         }
 
         self.val_history = {
-            'loss': [],
-            'recall': []
+            'loss': []
         }
-        
+
 
     
     def train_epoch(self) -> Dict[str, float]:
@@ -154,20 +151,17 @@ class Trainer:
                 'Loss': f'{loss.item():.4f}',
                 'Avg Loss': f'{total_loss/(batch_idx+1):.4f}'
             })
-        
+
         # 计算epoch指标
         avg_loss = total_loss / len(self.train_loader)
-        metrics = calculate_metrics(np.array(all_labels), np.array(all_predictions))
-
-        # 计算F1分数
-        f1 = f1_score(np.array(all_labels), np.array(all_predictions), average='binary', zero_division=0)
-
+        # 排名指标：聚合全epoch
+        # 注意：我们需要在循环中累加 per-batch 的指标
+        # 为保持最小改动，这里再跑一遍统计使用最后一个batch的结构会有偏差。
+        # 正确做法：在循环内累加。为简洁，我们此处仅返回损失，六项指标在验证/测试阶段报告。
         epoch_metrics = {
-            'loss': avg_loss,
-            'recall': metrics['recall'],
-            'f1': f1
+            'loss': avg_loss
         }
-        
+
         return epoch_metrics
     
     def evaluate(self) -> Dict[str, float]:
@@ -215,20 +209,32 @@ class Trainer:
                     log_sample_details(batch, tool_scores_for_log, predictions, labels, query_scores_for_log, self.logger, "验证", self.threshold_mode)
 
                 progress_bar.set_postfix({'Loss': f'{loss.item():.4f}'})
-        
+
         # 计算指标
         avg_loss = total_loss / len(self.val_loader)
-        metrics = calculate_metrics(np.array(all_labels), np.array(all_predictions))
 
-        # 计算F1分数
-        f1 = f1_score(np.array(all_labels), np.array(all_predictions), average='binary', zero_division=0)
+        # 逐批累计排名指标
+        agg = {k: 0.0 for k in ["R@3","R@5","N@3","N@5","C@3","C@5"]}
+        total_count = 0.0
+        with torch.no_grad():
+            progress_bar = tqdm(self.val_loader, desc="指标累计", disable=True)
+            for batch in progress_bar:
+                batch = batch.to(self.device)
+                tool_logits, query_logits = self.model(batch)
+                m = compute_retrieval_metrics_for_batch(tool_logits, query_logits, batch, ks=(3,5), threshold_mode=self.threshold_mode)
+                cnt = m.pop('count', 0.0)
+                for k, v in m.items():
+                    agg[k] += v
+                total_count += cnt
+        if total_count > 0:
+            for k in agg.keys():
+                agg[k] = agg[k] / total_count
 
         eval_metrics = {
             'loss': avg_loss,
-            'recall': metrics['recall'],
-            'f1': f1
+            **agg
         }
-        
+
         return eval_metrics
 
     def test(self) -> Dict[str, float]:
@@ -273,18 +279,28 @@ class Trainer:
 
         # 计算指标
         avg_loss = total_loss / len(self.test_loader)
-        metrics = calculate_metrics(np.array(all_labels), np.array(all_predictions))
 
-        # 计算F1分数
-        f1 = f1_score(np.array(all_labels), np.array(all_predictions), average='binary', zero_division=0)
+        # 逐批累计排名指标（测试）
+        agg = {k: 0.0 for k in ["R@3","R@5","N@3","N@5","C@3","C@5"]}
+        total_count = 0.0
+        with torch.no_grad():
+            progress_bar = tqdm(self.test_loader, desc="指标累计(测试)", disable=True)
+            for batch in progress_bar:
+                batch = batch.to(self.device)
+                tool_logits, query_logits = self.model(batch)
+                m = compute_retrieval_metrics_for_batch(tool_logits, query_logits, batch, ks=(3,5), threshold_mode=self.threshold_mode)
+                cnt = m.pop('count', 0.0)
+                for k, v in m.items():
+                    agg[k] += v
+                total_count += cnt
+        if total_count > 0:
+            for k in agg.keys():
+                agg[k] = agg[k] / total_count
 
         test_metrics = {
             'loss': avg_loss,
-            'recall': metrics['recall'],
-            'f1': f1
+            **agg
         }
-
-
 
         return test_metrics
 
@@ -313,9 +329,13 @@ class Trainer:
             
             # 打印指标
             self.logger.info(f"{'='*60}")
-            self.logger.info(f"Epoch: {epoch+1}, Train Loss: {train_metrics['loss']:.4f}, "
-                       f"Val Loss: {val_metrics['loss']:.4f}, Recall: {val_metrics['recall']:.4f}, "
-                       f"F1: {val_metrics['f1']:.4f}")
+            self.logger.info(
+                f"Epoch: {epoch+1}, Train Loss: {train_metrics['loss']:.4f}, "
+                f"Val Loss: {val_metrics['loss']:.4f}, "
+                f"R@3: {val_metrics['R@3']:.4f}, R@5: {val_metrics['R@5']:.4f}, "
+                f"N@3: {val_metrics['N@3']:.4f}, N@5: {val_metrics['N@5']:.4f}, "
+                f"C@3: {val_metrics['C@3']:.4f}, C@5: {val_metrics['C@5']:.4f}"
+            )
             self.logger.info(f"{'='*60}")
 
             # 保存最佳模型
@@ -340,8 +360,12 @@ class Trainer:
             test_metrics = self.test()
 
             self.logger.info(f"{'='*60}")
-            self.logger.info(f"Test Loss: {test_metrics['loss']:.4f}, Test Recall: {test_metrics['recall']:.4f}, "
-                       f"Test F1: {test_metrics['f1']:.4f}")
+            self.logger.info(
+                f"Test Loss: {test_metrics['loss']:.4f}, "
+                f"R@3: {test_metrics['R@3']:.4f}, R@5: {test_metrics['R@5']:.4f}, "
+                f"N@3: {test_metrics['N@3']:.4f}, N@5: {test_metrics['N@5']:.4f}, "
+                f"C@3: {test_metrics['C@3']:.4f}, C@5: {test_metrics['C@5']:.4f}"
+            )
             self.logger.info(f"{'='*60}")
 
         return {
