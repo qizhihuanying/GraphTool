@@ -50,7 +50,9 @@ class EmbeddingGenerator:
             self.model = AutoModel.from_pretrained(
                 self.model_name,
                 trust_remote_code=True,
-                torch_dtype=torch_dtype
+                torch_dtype=torch_dtype,
+                use_safetensors=True,
+                low_cpu_mem_usage=True
             )
 
             self.model = self.model.to(self.device)
@@ -439,20 +441,24 @@ def build_tool_graph_toolbench(config, all_data: List[Dict], train_val_data: Lis
 
 def create_training_samples_toolbench(data: List[Dict], tool_to_idx: Dict[str, int], embedding_generator: EmbeddingGenerator) -> List[Dict]:
     """
-    基于ToolBench G3数据创建样本
+    基于ToolBench数据创建样本（批量嵌入优化版）
 
     Returns:
         samples: 包含查询嵌入、子图节点索引、标签的样本列表
     """
-    logger.info("正在创建ToolBench样本...")
-    samples = []
+    logger.info("正在创建ToolBench样本（批量嵌入优化版）...")
     skipped_no_candidates = 0
     skipped_no_valid_tools = 0
     skipped_no_labels = 0
 
-    # 添加进度条
+    # 第一阶段：收集所有有效的查询和样本信息（不生成嵌入）
     from tqdm import tqdm
-    progress_bar = tqdm(data, desc="创建样本", unit="样本")
+    logger.info("第一阶段：收集有效查询和样本信息...")
+
+    valid_samples_info = []  # 存储有效样本的信息
+    query_texts = []  # 存储所有查询文本
+
+    progress_bar = tqdm(data, desc="收集有效样本", unit="样本")
 
     for sample in progress_bar:
         try:
@@ -504,40 +510,72 @@ def create_training_samples_toolbench(data: List[Dict], tool_to_idx: Dict[str, i
                 skipped_no_labels += 1
                 continue
 
-            # 5. 生成查询嵌入
-            query_embedding = embedding_generator.generate_embedding(user_query)
-
-            # 6. 创建子图节点索引
-            subgraph_node_indices = torch.tensor([tool_to_idx[tool] for tool in valid_candidate_tools], dtype=torch.long)
-
-            # 7. 创建标签（多标签二元分类）
+            # 5. 创建标签（多标签二元分类）
             labels = torch.zeros(len(valid_candidate_tools), dtype=torch.float)
             for i, tool in enumerate(valid_candidate_tools):
                 if tool in selected_tools:
                     labels[i] = 1.0
 
-            # 8. 检查是否有正标签
+            # 6. 检查是否有正标签
             if labels.sum() == 0:
                 skipped_no_labels += 1
                 continue
 
-            # 9. 创建样本
-            sample_data = {
-                'query_embedding': query_embedding,
-                'subgraph_node_indices': subgraph_node_indices,
-                'label': labels,
-                'query_text': user_query,  # 保存原始查询文本用于调试
-                'candidate_tools': valid_candidate_tools,  # 保存候选工具列表用于调试
-                'selected_tools': selected_tools  # 保存选中工具列表用于调试
-            }
-
-            samples.append(sample_data)
+            # 7. 保存有效样本信息（不生成嵌入）
+            valid_samples_info.append({
+                'user_query': user_query,
+                'valid_candidate_tools': valid_candidate_tools,
+                'selected_tools': selected_tools,
+                'labels': labels
+            })
+            query_texts.append(user_query)
 
         except Exception as e:
             logger.warning(f"处理样本时出错: {e}")
             continue
 
     progress_bar.close()
+
+    if not valid_samples_info:
+        logger.warning("没有找到任何有效样本")
+        logger.info(f"跳过统计: 无候选工具({skipped_no_candidates}), 无有效工具({skipped_no_valid_tools}), 无标签({skipped_no_labels})")
+        return []
+
+    # 第二阶段：批量生成所有查询的嵌入
+    logger.info(f"第二阶段：批量生成 {len(query_texts)} 个查询的嵌入...")
+    query_embeddings = embedding_generator.generate_batch_embeddings(query_texts)
+
+    # 第三阶段：组装最终样本
+    logger.info("第三阶段：组装最终样本...")
+    samples = []
+
+    assembly_bar = tqdm(enumerate(valid_samples_info), desc="组装样本", unit="样本", total=len(valid_samples_info))
+
+    for i, sample_info in assembly_bar:
+        try:
+            # 获取对应的查询嵌入
+            query_embedding = query_embeddings[i]
+
+            # 创建子图节点索引
+            subgraph_node_indices = torch.tensor([tool_to_idx[tool] for tool in sample_info['valid_candidate_tools']], dtype=torch.long)
+
+            # 创建最终样本
+            sample_data = {
+                'query_embedding': query_embedding,
+                'subgraph_node_indices': subgraph_node_indices,
+                'label': sample_info['labels'],
+                'query_text': sample_info['user_query'],  # 保存原始查询文本用于调试
+                'candidate_tools': sample_info['valid_candidate_tools'],  # 保存候选工具列表用于调试
+                'selected_tools': sample_info['selected_tools']  # 保存选中工具列表用于调试
+            }
+
+            samples.append(sample_data)
+
+        except Exception as e:
+            logger.warning(f"组装样本时出错: {e}")
+            continue
+
+    assembly_bar.close()
 
     logger.info(f"ToolBench样本创建完成:")
     logger.info(f"  成功创建: {len(samples)} 个样本")
@@ -557,8 +595,7 @@ def create_training_samples_toolbench(data: List[Dict], tool_to_idx: Dict[str, i
 
 
 def prepare_data(config):
-    """准备ToolBench数据：自动合并多个指定/默认路径的数据（支持G2+G3），构建图与样本"""
-    logger.info("开始ToolBench数据预处理（自动合并 G2+G3）...")
+    """准备ToolBench数据：支持G2/G3分别预处理或合并预处理，构建图与样本"""
 
     # 检查是否已有预处理数据
     if (config['FULL_GRAPH_PATH'].exists() and
@@ -571,22 +608,36 @@ def prepare_data(config):
     # 收集候选数据路径：优先使用 --dataset-path；若为空则默认 datasets/ToolBench 下的 G3 和 G2
     paths = []
     ds_path = config.get('dataset_path')
+    dataset_type = "merged"  # 默认合并类型
+
     if ds_path is not None:
         # 若传入的是目录，则合并目录下所有 *_query.json
         p = Path(ds_path)
         if p.is_dir():
             paths.extend(sorted(p.glob("*query.json")))
+            dataset_type = "merged"
         else:
             paths.append(p)
+            # 根据文件名确定数据集类型
+            if "G2" in p.name:
+                dataset_type = "G2"
+            elif "G3" in p.name:
+                dataset_type = "G3"
+            else:
+                dataset_type = "custom"
     else:
+        # 默认合并G2和G3
         default_g3 = config['TOOLBENCH_DIR'] / 'G3_query.json'
         default_g2 = config['TOOLBENCH_DIR'] / 'G2_query.json'
         for p in [default_g3, default_g2]:
             if p.exists():
                 paths.append(p)
+        dataset_type = "merged"
 
     if not paths:
         raise FileNotFoundError("未找到任何 ToolBench 数据文件，请提供 --dataset-path 或将 G2/G3 放到 datasets/ToolBench/")
+
+    logger.info(f"开始ToolBench数据预处理（类型: {dataset_type}）...")
 
     # 加载并合并
     all_data = []
@@ -595,7 +646,11 @@ def prepare_data(config):
         data = load_toolbench_g3_data(p)
         all_data.extend(data)
         total_each.append((p.name, len(data)))
-    logger.info("已合并数据文件：" + ", ".join([f"{n}:{c}" for n,c in total_each]) + f"；合计 {len(all_data)} 条")
+
+    if dataset_type == "merged":
+        logger.info("已合并数据文件：" + ", ".join([f"{n}:{c}" for n,c in total_each]) + f"；合计 {len(all_data)} 条")
+    else:
+        logger.info(f"加载{dataset_type}数据：" + ", ".join([f"{n}:{c}" for n,c in total_each]) + f"；合计 {len(all_data)} 条")
 
     # 随机打乱数据
     import random
@@ -675,12 +730,13 @@ def prepare_data(config):
     embedding_generator.save_cache(cache_path)
 
     logger.info("=" * 50)
-    logger.info("ToolBench 数据预处理完成！(G2+G3)")
+    logger.info(f"ToolBench 数据预处理完成！(类型: {dataset_type})")
     logger.info(f"API工具数量: {len(tool_to_idx)}")
     logger.info(f"图边数量: {edge_index.size(1)}")
     logger.info(f"训练样本: {len(train_samples)} 个")
     logger.info(f"验证样本: {len(val_samples)} 个")
     logger.info(f"测试样本: {len(test_samples)} 个")
+    logger.info(f"预处理数据保存到: {config['PREPROCESSED_DATA_DIR']}")
     logger.info("=" * 50)
 
 

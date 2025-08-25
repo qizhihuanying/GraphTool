@@ -64,8 +64,14 @@ class Trainer:
                 lr=config['LEARNING_RATE'],
                 weight_decay=config['WEIGHT_DECAY']
             )
+        elif config['OPTIMIZER'] == "AdamW":
+            self.optimizer = optim.AdamW(
+                self.model.parameters(),
+                lr=config['LEARNING_RATE'],
+                weight_decay=config['WEIGHT_DECAY']
+            )
         else:
-            raise ValueError(f"不支持的优化器: {config['OPTIMIZER']}")
+            raise ValueError(f"不支持的优化器: {config['OPTIMIZER']}，支持的优化器: Adam, AdamW")
 
         # 设置损失函数（使用带logits的稳定版本）
         self.criterion = nn.BCEWithLogitsLoss()

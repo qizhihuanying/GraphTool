@@ -4,15 +4,15 @@
 # 支持GPU队列管理和动态任务调度
 
 # 超参数配置
-LR_VALUES=(1e-4 3e-4 1e-5 3e-5 1e-6 3e-6 1e-7 1e-3)
+LR_VALUES=(1e-3 3e-3 1e-4 3e-4 1e-5 3e-5 1e-6 3e-6)
 L2_VALUES=(0 1e-7 1e-6 1e-5)
-GNN_TYPES=(GCN GAT)
-LAYER_VALUES=(2 3 4 10)
+GNN_TYPES=(GCN)
+LAYER_VALUES=(6 7 8 9 10)
 EPOCHS=5
 
 # GPU配置 - 用户可修改这个数组来控制并发数
 # 例如: GPUS=(6 6 6 7 7 7) 表示GPU6和GPU7各跑3个并发任务
-GPUS=(0 1 2 3 4 5 7)  # 默认配置，用户可根据需要修改
+GPUS=(0 0 0 1 1 1 2 2 2 4 4 4 5 5 5 6 6 6 7 7 7)  # 默认配置，用户可根据需要修改
 
 # 全局变量
 declare -a RUNNING_JOBS=()  # 存储正在运行的任务PID
@@ -88,6 +88,15 @@ start_experiment() {
         echo "🚀 [实验开始] $exp_name - GPU $gpu_id"
         echo "========================================"
         $cmd
+
+        # 实验完成后立即清理checkpoint文件以节省磁盘空间
+        checkpoint_file="outputs/models/${exp_name}_best.pt"
+        if [[ -f "$checkpoint_file" ]]; then
+            file_size=$(du -h "$checkpoint_file" | cut -f1)
+            rm -f "$checkpoint_file"
+            echo "🗑️  已清理checkpoint: ${exp_name}_best.pt (节省 $file_size)"
+        fi
+
         echo "========================================"
         echo "✅ [实验完成] $exp_name - GPU $gpu_id"
         echo ""
@@ -162,8 +171,13 @@ main() {
     echo "GraphTool 超参数搜索启动"
     echo "=========================="
 
-    # 创建日志目录
+    # 创建日志目录和锁文件目录
     mkdir -p outputs/logs
+    mkdir -p outputs
+
+    # 创建搜参锁文件，避免其他进程（如 o.py --auto）在期间占用GPU
+    HPARAM_LOCK="outputs/hparam_search_running.lock"
+    echo "$(date)" > "$HPARAM_LOCK"
 
     # 初始化
     init_gpu_usage
@@ -203,6 +217,13 @@ main() {
     done
 
     echo "所有实验已完成！"
+
+    # 删除搜参锁文件，允许 o.py --auto 开始检测并占用GPU
+    if [[ -f "$HPARAM_LOCK" ]]; then
+        rm -f "$HPARAM_LOCK"
+        echo "已删除锁文件: $HPARAM_LOCK"
+    fi
+
     # 汇总 TOP-3（按测试集 R@5）
     echo "\n基于测试 R@5 的 TOP-3:"
     declare -a SCORED=()
@@ -256,6 +277,12 @@ cleanup() {
             kill "$pid"
         fi
     done
+
+    # 清理锁文件
+    if [[ -f "$HPARAM_LOCK" ]]; then
+        rm -f "$HPARAM_LOCK"
+        echo "已删除锁文件: $HPARAM_LOCK"
+    fi
 
     echo "清理完成"
     exit 0

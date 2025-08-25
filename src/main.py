@@ -22,12 +22,39 @@ def create_config(args):
     # 数据相关路径
     DATASET_DIR = PROJECT_ROOT / "datasets"
     TOOLBENCH_DIR = DATASET_DIR / "ToolBench"
-    PREPROCESSED_DATA_DIR = TOOLBENCH_DIR / "preprocessed_data"
+
+    # 根据dataset参数与嵌入模型确定预处理数据目录和数据路径（目录命名：<模型名>+l2 / <模型名>+l3）
+    model_tag = str(getattr(args, 'embedding_model', 'model')).replace('/', '_')
+    if args.dataset:
+        if args.dataset.lower() == "l2":
+            PREPROCESSED_DATA_DIR = TOOLBENCH_DIR / "preprocessed_data" / f"{model_tag}+l2"
+            dataset_file_path = TOOLBENCH_DIR / "G2_query.json"
+        elif args.dataset.lower() == "l3":
+            PREPROCESSED_DATA_DIR = TOOLBENCH_DIR / "preprocessed_data" / f"{model_tag}+l3"
+            dataset_file_path = TOOLBENCH_DIR / "G3_query.json"
+        else:
+            raise ValueError(f"不支持的数据集: {args.dataset}，支持的选项: l2, l3")
+    else:
+        # 默认使用合并目录（向后兼容）：<模型名>+l2+l3
+        PREPROCESSED_DATA_DIR = TOOLBENCH_DIR / "preprocessed_data" / f"{model_tag}+l2+l3"
+        dataset_file_path = None
 
     # 输出路径
     OUTPUTS_DIR = PROJECT_ROOT / "outputs"
     MODELS_DIR = OUTPUTS_DIR / "models"
-    LOGS_DIR = OUTPUTS_DIR / "logs"
+
+    # 日志目录也按模型名+数据集命名
+    model_tag = str(getattr(args, 'embedding_model', 'model')).replace('/', '_')
+    if args.dataset:
+        if args.dataset.lower() == "l2":
+            LOGS_DIR = OUTPUTS_DIR / "logs" / f"{model_tag}+l2"
+        elif args.dataset.lower() == "l3":
+            LOGS_DIR = OUTPUTS_DIR / "logs" / f"{model_tag}+l3"
+        else:
+            LOGS_DIR = OUTPUTS_DIR / "logs" / f"{model_tag}+{args.dataset}"
+    else:
+        # 默认使用合并目录（向后兼容）
+        LOGS_DIR = OUTPUTS_DIR / "logs" / f"{model_tag}+l2+l3"
 
     # 创建必要的目录
     directories = [DATASET_DIR, TOOLBENCH_DIR, PREPROCESSED_DATA_DIR, OUTPUTS_DIR, MODELS_DIR, LOGS_DIR]
@@ -45,7 +72,7 @@ def create_config(args):
         'MODELS_DIR': MODELS_DIR,
         'LOGS_DIR': LOGS_DIR,
 
-        'dataset_path': Path(args.dataset_path) if getattr(args, 'dataset_path', None) else (TOOLBENCH_DIR / 'G3_query.json'),
+        'dataset_path': dataset_file_path,
         # 预处理数据文件路径
         'FULL_GRAPH_PATH': PREPROCESSED_DATA_DIR / "full_graph.pt",
         'TRAINING_SAMPLES_PATH': PREPROCESSED_DATA_DIR / "training_samples.pt",
@@ -129,8 +156,8 @@ def parse_arguments():
     # 数据参数
     parser.add_argument('--batch-size', type=int, default=32,
                        help='批大小 (默认: 32)')
-    parser.add_argument('--dataset-path', type=str, default=None,
-                       help='G3_query.json 路径，优先于默认 datasets/ToolBench/G3_query.json')
+    parser.add_argument('--dataset', type=str, default=None, choices=['l2', 'l3'],
+                       help='数据集选择：l2(G2数据) 或 l3(G3数据)，默认合并G2+G3数据')
 
     # 模型参数
     parser.add_argument('--gnn-type', type=str, default='GCN',
@@ -158,10 +185,11 @@ def parse_arguments():
                        help='学习率 (默认: 1e-4)')
     parser.add_argument('--weight-decay', type=float, default=0,
                        help='L2正则化参数 (默认: 0)')
-    parser.add_argument('--optimizer', type=str, default='Adam',
-                       help='优化器类型 (默认: Adam)')
-    parser.add_argument('--early-stopping-patience', type=int, default=2,
-                       help='早停耐心值 (默认: 2)')
+    parser.add_argument('--optimizer', type=str, default='AdamW',
+                       choices=['Adam', 'AdamW'],
+                       help='优化器类型 (默认: AdamW)')
+    parser.add_argument('--early-stopping-patience', type=int, default=5,
+                       help='早停耐心值 (默认: 5)')
     parser.add_argument('--train-split', type=float, default=0.7,
                        help='训练集比例 (默认: 0.7)')
     parser.add_argument('--val-split', type=float, default=0.1,
@@ -174,9 +202,9 @@ def parse_arguments():
                        help='共现阈值K，用于创建边 (默认: 2)')
     parser.add_argument('--max-sequence-length', type=int, default=512,
                        help='文本最大长度 (默认: 512)')
-    parser.add_argument('--embed-batch-size', type=int, default=1,
-                       help='预处理时生成嵌入的批大小 (默认: 1)')
-    parser.add_argument('--embed-dtype', type=str, choices=['fp16', 'fp32'], default='fp32',
+    parser.add_argument('--embed-batch-size', type=int, default=4,
+                       help='预处理时生成嵌入的批大小 (默认: 4)')
+    parser.add_argument('--embed-dtype', type=str, choices=['fp16', 'fp32'], default='fp16',
                        help='预处理嵌入模型权重精度: fp16 或 fp32 (默认: fp16)')
 
     # 设备参数
@@ -192,8 +220,67 @@ def parse_arguments():
                        help='模型保存名称 (默认: query_aware_gnn)')
     parser.add_argument('--log-name', type=str, default='debug',
                        help='日志文件名称 (默认: debug)')
+    parser.add_argument('--zero-shot', action='store_true',
+                       help='启用零样本基线：跳过训练，仅基于嵌入相似度进行测试评估')
 
     return parser.parse_args()
+
+
+def zero_shot_evaluate(config, test_loader, logger):
+    """使用嵌入余弦相似度进行零样本预测并评估指标"""
+    import torch
+    from utils import create_node_masks, compute_retrieval_metrics_for_batch
+    from tqdm import tqdm
+
+    device = config['DEVICE']
+    agg = {k: 0.0 for k in ["R@3","R@5","N@3","N@5","C@3","C@5"]}
+    total_count = 0.0
+
+    def l2norm(t):
+        return t / (t.norm(dim=1, keepdim=True).clamp_min(1e-6))
+
+    logger.info("开始零样本评估（基于嵌入余弦相似度）...")
+
+    with torch.no_grad():
+        progress_bar = tqdm(test_loader, desc="零样本评估", unit="batch")
+        for batch in progress_bar:
+            batch = batch.to(device)
+            # 掩码与索引
+            query_mask, tool_mask = create_node_masks(batch.batch, batch.num_graphs)
+            tool_batch_indices = batch.batch[tool_mask]
+
+            # 取出查询与工具特征
+            queries = batch.x[query_mask]
+            tools = batch.x[tool_mask]
+
+            # 余弦相似度
+            qn = l2norm(queries[tool_batch_indices])
+            tn = l2norm(tools)
+            sims = (qn * tn).sum(dim=1)
+
+            # 将相似度作为tool_logits，query_logits置0（score=sims-0）
+            tool_logits = sims
+            query_logits = torch.zeros(batch.num_graphs, device=device)
+
+            m = compute_retrieval_metrics_for_batch(tool_logits, query_logits, batch, ks=(3,5), threshold_mode='query')
+            cnt = m.pop('count', 0.0)
+            for k, v in m.items():
+                agg[k] += v
+            total_count += cnt
+
+    if total_count > 0:
+        for k in agg.keys():
+            agg[k] = agg[k] / total_count
+
+    logger.info(f"{'='*60}")
+    logger.info(
+        f"Zero-shot Test: R@3: {agg['R@3']:.4f}, R@5: {agg['R@5']:.4f}, "
+        f"N@3: {agg['N@3']:.4f}, N@5: {agg['N@5']:.4f}, C@3: {agg['C@3']:.4f}, C@5: {agg['C@5']:.4f}"
+    )
+    logger.info(f"{'='*60}")
+
+    return {"loss": float('nan'), **agg}
+
 
 def main():
     # 解析参数
@@ -207,9 +294,7 @@ def main():
 
     # 打印配置信息
     gpu_info = f"GPU-{config.get('GPU_ID')}" if config.get('GPU_ID') is not None else "auto"
-    logger.info(f"Config: Device={config['DEVICE']} ({gpu_info}), Batch={args.batch_size}, GNN={config['GNN_TYPE']}, "
-               f"Layers={config['GNN_LAYERS']}, Hidden={config['HIDDEN_DIM']}, Epochs={args.epochs}, LR={config['LEARNING_RATE']}, "
-               f"WD={config['WEIGHT_DECAY']}, Dropout={config['DROPOUT_RATE']}, Threshold={args.threshold_mode}")
+    logger.info(f"Config: Device={config['DEVICE']}({gpu_info}), Dataset={args.dataset or 'G2+G3'}, Batch={args.batch_size}, GNN={config['GNN_TYPE']}, Layers={config['GNN_LAYERS']}, Hidden={config['HIDDEN_DIM']}, Epochs={args.epochs}, LR={config['LEARNING_RATE']}, WD={config['WEIGHT_DECAY']}, Optimizer={args.optimizer}, Dropout={config['DROPOUT_RATE']}, Threshold={args.threshold_mode}, EmbedModel={args.embedding_model.split('/')[-1]}, EmbedDim={config['EMBEDDING_DIM']}, MLPHidden={config['MLP_HIDDEN_DIM']}, Heads={args.num_heads}, EarlyStop={args.early_stopping_patience}, CoOccur={args.co_occurrence_threshold}, EmbedBatch={args.embed_batch_size}, EmbedDtype={args.embed_dtype}")
 
 
 
@@ -234,6 +319,11 @@ def main():
             batch_size=args.batch_size,
             include_test=True
         )
+
+        # 如果开启zero-shot，直接在测试集上做零样本评估
+        if args.zero_shot:
+            zero_shot_evaluate(config, test_loader, logger)
+            return
 
         # 创建模型
         model = create_model(config)
